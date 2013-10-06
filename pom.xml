@@ -8,5 +8,13 @@
     <artifactId>codeSample</artifactId>
     <version>1.0-SNAPSHOT</version>
 
-    
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>fluent-hc</artifactId>
+            <version>4.3</version>
+        </dependency>
+    </dependencies>
+
+
 </project>
