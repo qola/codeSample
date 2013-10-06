@@ -1,0 +1,14 @@
+#!/usr/bin/python
+
+import os
+import shutil
+
+srcfile = '/Users/leejonghee/synergy.conf'
+dstdir = '/Users/leejonghee/test'
+
+
+#assert not os.path.isabs(scrfile)
+#dstdir =  os.path.join(dstroot, os.path.dirname(scrfile))
+
+os.makedirs(dstdir) # create all directories, raise an error if it already exists
+shutil.copy(srcfile, dstdir)
