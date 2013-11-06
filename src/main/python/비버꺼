@@ -1,0 +1,298 @@
+#!/pang/program/python/bin/python
+#coding: utf-8
+import time
+import subprocess
+import sys
+import json
+import _mysql
+import re
+from datetime import date, timedelta
+
+TODAY = ""
+POLLING_LOG = 'false'
+if len(sys.argv) == 3:
+    TODAY = sys.argv[1]
+    POLLING_LOG = sys.argv[2]
+elif len(sys.argv) == 2:
+    YESTERDAY = date.today() - timedelta(1)
+    TODAY = YESTERDAY.strftime('%Y%m%d')
+    POLLING_LOG = sys.argv[1]
+else:
+    print "Usage : ./order_flow_analyzer.py [date] (true|false)"
+    print "e.g) ./order_flow_analyzer.py 20130629 true"
+    print "e.g) ./order_flow_analyzer.py true"
+    exit(1)
+
+ORDER_LOG_HOME = "/pang/logs/trace_order"
+ORDER_LOG_NAME = "trace_order.log"
+HOSTS = ["web01", "web02", "web03", "web04", "web05", "web06", "web07", "web08", "web09", "web10"]
+
+db = _mysql.connect(host="dd", port=3306, passwd="dd", db="dd", user="dd")
+subprocess.call(["mkdir", "-p", ORDER_LOG_HOME + "/" + TODAY])
+subprocess.call("find /pang/logs/trace_order -mtime +30 -type d | xargs rm -rf", shell=True)
+
+if POLLING_LOG == 'true':
+    for host in HOSTS:
+        srcArg = host + ":" + ORDER_LOG_HOME + "/" + ORDER_LOG_NAME + "." + TODAY + ".gz"
+        dstArg = ORDER_LOG_HOME + "/" + TODAY + "/" + host + "." + ORDER_LOG_NAME + "." + TODAY + ".gz"
+        print srcArg, dstArg
+        subprocess.call(["scp", srcArg , dstArg])
+        subprocess.call(["gunzip", dstArg])
+
+print "analyze pv"
+commandBuilder = []
+commandBuilder.append("grep -h 'status:NORMAL' " + ORDER_LOG_HOME + "/" + TODAY + "/*")
+commandBuilder.append("grep -E -o 'type:[a-zA-Z_]+|browser:[a-zA-Z]+'")
+commandBuilder.append("awk '{type=$0; getline; print type \" \"  $0}'")
+commandBuilder.append("sed -E -e 's/type:(.*)/\\1/g' -e 's/browser:(.*)/\\1/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+commandBuilder.append("sort")
+commandBuilder.append("uniq -c")
+commandBuilder.append("awk '{sum+=$1;}(NR == 1){prev1 = $1;prev2=$2}($2 != prev2){print sum-$1\" \"prev2\" ALL\"  \"\\n\" $1\" \"$2\" \"$3;sum=$1;prev1=$1;prev2=$2;next}1; END{print sum\" \"prev2\" ALL\";}'")
+
+pvRawLogs = subprocess.check_output('|'.join(commandBuilder), shell=True)
+pvResult = {"ALL":{}, "PC":{},"Mobile":{},"Unknown":{}}
+
+def buildPvResult(platform):
+    try:
+        if pageType:
+            pageTypePrefix = pageType.group(1)
+            pageSubType = pageType.group(2)
+            if pageTypePrefix not in pvResult:
+                pvResult[platform][pageTypePrefix] = []
+            pvResult[platform][pageTypePrefix].append({ "TYPE":pageSubType, "COUNT" : count })
+        else:
+            pvResult[platform][type] = count
+    except Exception:
+        print Exception
+        print  "platform = " + platform +", type = " + type
+
+for rawLog in pvRawLogs.split('\n'):
+    if rawLog:
+        splited = rawLog.strip().split(' ')
+        count = splited[0]
+        type = splited[1]
+        browser = splited[2]
+        pageType = re.search("(ORDER_REQUEST|ORDER_RESULT)_(.*)", type)
+        buildPvResult(browser)
+
+for browser in pvResult:
+    pvResultToJson = json.dumps(pvResult[browser])
+    pvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser)
+        VALUES('{0}', '{1}', '{2}', '{3}')
+        ON DUPLICATE KEY UPDATE stat = '{4}'""".format("PV", pvResultToJson, TODAY, browser, pvResultToJson)
+    db.query(pvQuery)
+
+
+print "analyze uv"
+commandBuilder = []
+commandBuilder.append("grep -h 'status:NORMAL' " + ORDER_LOG_HOME + "/" + TODAY + "/*")
+commandBuilder.append("grep -v -E '(NOT_LOGIN)'")
+commandBuilder.append("grep -E -o 'type:[A-Za-z_]+ memberSrl:[a-zA-Z0-9]+|browser:[a-zA-Z]+'")
+commandBuilder.append("sed -E -e 's/(ORDER_REQUEST)_[A-Z]+/\\1/g' -e 's/browser:(.*)/\\1/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+commandBuilder.append("awk '{printf(\"%s%s\",$0,(NR%2?\" \":\"\\n\"))}'")
+commandBuilder.append("sort")
+commandBuilder.append("uniq")
+commandBuilder.append("sed -E 's/type:([A-Z_]+) .* /\\1 /g'")
+commandBuilder.append("sort")
+commandBuilder.append("uniq -c")
+commandBuilder.append("awk '{sum+=$1;}(NR == 1){prev1 = $1;prev2=$2}($2 != prev2){print sum-$1\" \"prev2\" ALL\"  \"\\n\" $1\" \"$2\" \"$3;sum=$1;prev1=$1;prev2=$2;next}1; END{print sum\" \"prev2\" ALL\";}'")
+
+uvRawLogs = subprocess.check_output("|".join(commandBuilder), shell=True)
+uvResult = {"ALL":{},"PC":{},"Mobile":{},"Unknown":{}}
+
+for rawLog in uvRawLogs.split('\n'):
+    if rawLog:
+        try:
+            splited = rawLog.strip().split(' ')
+            count = splited[0]
+            type = splited[1]
+            browser = splited[2]
+            uvResult[browser][type] = count
+        except Exception:
+            print Exception
+            print "rawLog = " + rawLog
+
+for browser in uvResult:
+    uvResultToJson = json.dumps(uvResult[browser])
+    uvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser) VALUES('{0}', '{1}', '{2}', '{3}') ON DUPLICATE KEY UPDATE stat = '{4}'""".format("UV", uvResultToJson, TODAY, browser, uvResultToJson)
+    db.query(uvQuery)
+
+ print "analyze payTypePv"
+ commandBuilder = []
+ commandBuilder.append("grep -h 'status:NORMAL' " + ORDER_LOG_HOME + "/" + TODAY + "/*")
+ commandBuilder.append("grep -v -E '(ORDER_FORM|NOT_LOGIN)'")
+ commandBuilder.append("sed -E -e 's/(ORDER_REQUEST)_[A-Z]+/\\1/g' -e 's/.*type:([A-Z_]+).*browser:([a-zA-Z]+).*payType:([a-zA-Z]+).*/\\3 \\1 \\2/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+ commandBuilder.append("sort")
+ commandBuilder.append("uniq -c")
+ commandBuilder.append("awk '{sum+=$1;}(NR == 1){prev1 = $1;prev2=$2;prev3=$3}($2 != prev2 || $3 != prev3){print sum-$1\" \"prev2\" \"prev3\" ALL\"  \"\\n\" $1\" \"$2\" \"$3\" \"$4;sum=$1;prev1=$1;prev2=$2;prev3=$3;next}1; END{print sum\" \"prev2\" \"prev3\" ALL\";}'")
+ payTypePvRawLogs = subprocess.check_output("|".join(commandBuilder), shell=True)
+ payTypePvResult = {"ALL":[],"PC":[],"Mobile":[],"Unknown":[]}
+ payTypePvMap = {"ALL":{},"PC":{},"Mobile":{},"Unknown":{}}
+
+ print payTypePvRawLogs
+
+ for rawLog in payTypePvRawLogs.split('\n'):
+     if rawLog:
+         try:
+             splited = rawLog.strip().split(' ')
+             if(len(splited)<4):
+                 continue
+             count = splited[0]
+             payType = splited[1]
+             if payType == "INFO":
+                 continue
+             pageType = splited[2]
+             browser = splited[3]
+             if payType not in payTypePvMap[browser]:
+                 payTypePvMap[browser][payType] = []
+             payTypePvMap[browser][payType].append({"TYPE" : pageType, "COUNT" : count})
+         except Exception:
+             print Exception
+             print "rawLog = " + rawLog
+
+ for browser in payTypePvMap:
+     for key in payTypePvMap[browser]:
+         if (key != 'undefined'):
+             payTypePvResult[browser].append({ "PAY_TYPE" : key, "PAGES" : payTypePvMap[browser][key]})
+ n = 0
+ for browser in payTypePvResult:
+     payTypePvResultToJson =json.dumps({ "RESULT": payTypePvResult[browser]})
+     uvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser) VALUES('{0}', '{1}', '{2}', '{3}') ON DUPLICATE KEY UPDATE stat = '{4}'""".format("PAYTYPE_PV", payTypePvResultToJson, TODAY, browser, payTypePvResultToJson)
+     db.query(uvQuery)
+
+ print "analyze payTypeUv"
+
+ commandBuilder = []
+ commandBuilder.append("grep -h 'status:NORMAL' " + ORDER_LOG_HOME + "/" + TODAY + "/*")
+ commandBuilder.append("grep -v -E '(ORDER_FORM|NOT_LOGIN)'")
+ commandBuilder.append("sed -E -e 's/(ORDER_REQUEST)_[A-Z]+/\\1/g' -e 's/.*type:([A-Z_]+).*memberSrl:([0-9]+).*browser:([a-zA-Z]+).*payType:([a-zA-Z]+).*/\\4 \\1 \\2 \\3/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+ commandBuilder.append("sort")
+ commandBuilder.append("uniq")
+ commandBuilder.append("sed -E 's/([A-Z]+) ([A-Z_]+) .* ([a-zA-Z]+)/\\1 \\2 \\3/g'")
+ commandBuilder.append("sort")
+ commandBuilder.append("uniq -c")
+ commandBuilder.append("awk '{sum+=$1;}(NR == 1){prev1 = $1;prev2=$2;prev3=$3}($2 != prev2 || $3 != prev3){print sum-$1\" \"prev2\" \"prev3\" ALL\"  \"\\n\" $1\" \"$2\" \"$3\" \"$4;sum=$1;prev1=$1;prev2=$2;prev3=$3;next}1; END{print sum\" \"prev2\" \"prev3\" ALL\";}'")
+
+payTypeUvRawLogs = subprocess.check_output("|".join(commandBuilder), shell=True)
+payTypeUvResult = {"ALL":[],"PC":[],"Mobile":[],"Unknown":[]}
+payTypeUvMap = {"ALL":{},"PC":{},"Mobile":{},"Unknown":{}}
+
+print payTypeUvRawLogs
+
+for rawLog in payTypeUvRawLogs.split('\n'):
+    if rawLog:
+        splited = rawLog.strip().split(' ')
+        if(len(splited)<4):
+            continue
+        count = splited[0]
+        payType = splited[1]
+        if payType == "INFO":
+            continue
+        pageType = splited[2]
+        browser = splited[3]
+        print splited
+        try:
+            if payType not in payTypeUvMap[browser]:
+                payTypeUvMap[browser][payType] = []
+        except Exception:
+            print Exception
+            print "Unknown payType: " + payType
+            continue
+        payTypeUvMap[browser][payType].append({"TYPE" : pageType, "COUNT" : count})
+
+for browser in payTypeUvMap:
+    for key in payTypeUvMap[browser]:
+        if (key != 'undefined'):
+            payTypeUvResult[browser].append({ "PAY_TYPE" : key, "PAGES" : payTypeUvMap[browser][key]})
+n = 0
+for browser in payTypeUvResult:
+    payTypeUvResultToJson =json.dumps({ "RESULT": payTypeUvResult[browser]})
+    uvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser) VALUES('{0}', '{1}', '{2}', '{3}') ON DUPLICATE KEY UPDATE stat = '{4}'""".format("PAYTYPE_UV", payTypeUvResultToJson, TODAY, browser, payTypeUvResultToJson)
+    db.query(uvQuery)
+
+print "analyze payTypeCheckoutUv"
+commandBuilder = []
+commandBuilder.append("grep -h 'status:NORMAL'  " + ORDER_LOG_HOME + "/" + TODAY + "/*")
+commandBuilder.append("grep -v -E '(ORDER_FORM|NOT_LOGIN)'")
+commandBuilder.append("grep -E 'memberSrl:[0-9]+.*checkoutId:[0-9]+'")
+commandBuilder.append("sed -E -e 's/(ORDER_REQUEST)_[A-Z]+/\\1/g' -e 's/.*type:([A-Z_]+).*memberSrl:([0-9]+).*browser:([a-zA-Z]+).*payType:([a-zA-Z]+).*checkoutId:([0-9]+).*/\\4 \\1 \\3 \\2 \\5/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+commandBuilder.append("sort")
+commandBuilder.append("uniq")
+commandBuilder.append("sed -E 's/([A-Z]+) ([A-Z_]+) ([a-zA-Z_]+).*/\\1 \\2 \\3/g'")
+commandBuilder.append("uniq -c")
+commandBuilder.append("awk '{sum+=$1;}(NR == 1){prev1 = $1;prev2=$2;prev3=$3}($2 != prev2 || $3 != prev3){print sum-$1\" \"prev2\" \"prev3\" ALL\"  \"\\n\" $1\" \"$2\" \"$3\" \"$4;sum=$1;prev1=$1;prev2=$2;prev3=$3;next}1; END{print sum\" \"prev2\" \"prev3\" ALL\";}'")
+
+payTypeCheckoutUvRawLogs = subprocess.check_output("|".join(commandBuilder), shell=True)
+payTypeCheckoutUvResult = {"ALL":[],"PC":[],"Mobile":[],"Unknown":[]}
+payTypeCheckoutUvMap = {"ALL":{},"PC":{},"Mobile":{},"Unknown":{}}
+
+print payTypeCheckoutUvRawLogs;
+
+for rawLog in payTypeCheckoutUvRawLogs.split('\n'):
+    if rawLog:
+        try:
+            splited = rawLog.strip().split(' ')
+            if len(splited) < 4:
+                continue
+            count = splited[0]
+            payType = splited[1]
+            if payType == "INFO":
+                continue
+
+            pageType = splited[2]
+            browser = splited[3]
+            if payType not in payTypeCheckoutUvMap[browser]:
+                payTypeCheckoutUvMap[browser][payType] = []
+            payTypeCheckoutUvMap[browser][payType].append({"TYPE" : pageType, "COUNT" : count})
+        except Exception:
+            print Exception
+            print "rawLog = " + rawLog
+
+for browser in payTypeCheckoutUvMap:
+    for key in payTypeCheckoutUvMap[browser]:
+        if (key != 'undefined'):
+            payTypeCheckoutUvResult[browser].append({ "PAY_TYPE" : key, "PAGES" : payTypeCheckoutUvMap[browser][key] })
+
+
+for browser in payTypeCheckoutUvResult:
+    payTypeCheckoutUvResultToJson = json.dumps({ "RESULT": payTypeCheckoutUvResult[browser] })
+    uvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser) VALUES('{0}', '{1}', '{2}', '{3}') ON DUPLICATE KEY UPDATE stat = '{4}'""".format("PAYTYPE_CHECKOUT_UV", payTypeCheckoutUvResultToJson, TODAY, browser, payTypeCheckoutUvResultToJson)
+    db.query(uvQuery)
+
+
+print "analyze requestError"
+
+commandBuilder = []
+commandBuilder.append("grep -E -h 'ORDER_REQUEST.*payType:[A-Z]+.*status:ABNORMAL.*error:[^ ]+' "+ ORDER_LOG_HOME + "/" + TODAY + "/*")
+commandBuilder.append("sed -E -e 's/.*browser:([a-zA-Z]+).*payType:(\s|\w+) .*error:([a-zA-Z0-9_]+).*/\\2 \\3 \\1/g' -e 's/(MSIE|Chrome|Firefox|Safari)/PC/g'")
+commandBuilder.append("sort")
+commandBuilder.append("uniq -c")
+
+requestErrors = subprocess.check_output("|".join(commandBuilder), shell=True)
+
+requestErrorResult = {"PC":[],"Mobile":[],"Unknown":[]}
+
+requestErrorMap ={"PC":{},"Mobile":{},"Unknown":{}}
+
+print requestErrors
+
+for requestError in requestErrors.split('\n'):
+    if requestError:
+        splited = requestError.strip().split(' ')
+        if len(splited) > 2:
+            count = splited[0]
+            type = splited[1]
+            errorCode = splited[2]
+            browser = splited[3]
+            if type not in requestErrorMap[browser]:
+                requestErrorMap[browser][type]=[]
+            requestErrorMap[browser][type].append({"CODE":errorCode,"COUNT":count })
+
+for browser in requestErrorMap:
+    for key in requestErrorMap[browser]:
+        requestErrorResult[browser].append({"PAY_TYPE":key, "ERRORS":requestErrorMap[browser][key]})
+
+for browser in requestErrorMap:
+    requestErrorToJson =json.dumps({ "RESULT": requestErrorResult[browser]})
+    uvQuery = """INSERT IGNORE INTO doupang.order_stat_test(type, stat, created, browser) VALUES('{0}', '{1}', '{2}', '{3}') ON DUPLICATE KEY UPDATE stat = '{4}'""".format("REQUEST_ERROR", requestErrorToJson, TODAY, browser, requestErrorToJson)
+    db.query(uvQuery)

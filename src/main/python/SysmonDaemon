@@ -1,0 +1,1861 @@
+#!/usr/bin/env python
+# -*- coding: utf8 -*-
+
+"""
+SYStem MONitoring (SYSMON)
+
+@version: 1.0
+@author: Jeong Jae-Hoon.
+@copyright: Copyright (C) 2007-2008 NHN Corp. All Rights Reserved
+"""
+
+import re
+import os
+import sys
+import time
+import signal
+import datetime
+import MySQLdb
+import logging
+import logging.config
+import ConfigParser
+from sets import Set
+from pprint import *
+from socket import *
+from threading import *
+from AndroFilter import *
+from DBUtils.PooledDB import PooledDB
+
+__author__  = "Jeong JaeHoon <jibong96@naver.com>"
+__status__  = "alpha"
+__version__ = "1.0.0"
+__date__    = "2008-09-03"
+
+#------------------------------------------------------------------------
+# Variable
+DBPOOL = None
+history = None
+job = None
+
+#------------------------------------------------------------------------
+# Constant
+MAIN_FILE       = './conf/daemon.conf'
+LOG_FILE        = './conf/log.daemon.conf'
+ALERT_FILE      = './conf/alert.conf'
+ALERT_HOLD_FILE = './conf/alerthold.conf'
+SERVERDB_FILE   = './conf/serverdb.conf'
+SYSMONDB_FILE   = './conf/sysmondb.conf'
+
+ALERT_STATE_DIR = './output/alert'
+SMS_POOL_DIR    = './output/sms'
+
+MARK_ON = True
+MARK_OFF = False
+KILL_AND_RESTART = True
+JUST_RESTART = False
+RUNMODE_NONE = 0
+RUNMODE_AGENT = 1
+RUNMODE_DBAGENT = 2
+
+RESPONSE_NOT_INSTALLED = "1"
+RESPONSE_INSTALLED = "0"
+
+#------------------------------------------------------------------------
+# Class
+
+class DB:
+    def __init__(self, property):
+        self.db = None
+        self.host = property['HOST']
+        self.port = property['PORT']
+        self.user = property['USER']
+        self.passwd = property['PASS']
+        self.dbname = property['NAME']
+        self.min = property['MIN']
+        self.max = property['MAX']
+
+        self.__create()
+
+    def __create(self):
+        global DBPOOL
+        try:
+            if DBPOOL==None:
+                DBPOOL = PooledDB(creator=MySQLdb,mincached=self.min,maxcached=self.max,maxshared=0,
+                                maxconnections=0,blocking=False,maxusage=100,setsession=[],
+                                host=self.host, port=self.port, user=self.user, passwd=self.passwd, db=self.dbname)
+
+        except Exception, e:
+            logging.exception("Can't connect to a database.")
+
+    def execute(self, cmd=None):
+        nSuccess = 0
+        db = None
+        cursor = None
+
+        if cmd == None: return False
+
+        try:
+            db = DBPOOL.connection(0)
+            cursor = db.cursor()
+            cursor.execute('set names utf8')
+            cursor.execute(cmd)
+
+            db.commit()
+
+            nSuccess = cursor.rowcount
+
+        except Exception, e:
+            logging.exception("Can't run a query. %s"%(cmd))
+
+        if cursor!=None: cursor.close()
+        if db!=None: db.close()
+
+        return nSuccess
+
+    def executeAll(self, cmd, data):
+        nSuccess = 0
+        db = None
+        cursor = None
+
+        if cmd == None: return False
+
+        try:
+            #total = len(data)
+
+            db=DBPOOL.connection(0)
+            cursor = db.cursor()
+            cursor.execute('set names utf8')
+
+            #start = 0
+            #while start < total:
+            #    datapart = data[start:start+10000]
+            #    cursor.executemany(cmd, datapart)
+            #    start += 10000
+            cursor.executemany(cmd, data)
+            db.commit()
+        except Exception, e:
+            logging.exception("Can't run a query. %s"%(cmd))
+
+        if cursor!=None: cursor.close()
+        if db!=None: db.close()
+
+    def select(self, cmd=None):
+        db = None
+        cursor = None
+        records = None
+
+        if cmd == None: return None
+
+        try:
+            db=DBPOOL.connection(0)
+            cursor = db.cursor(MySQLdb.cursors.DictCursor)
+            cursor.execute('set names utf8')
+            cursor.execute(cmd)
+            records = cursor.fetchall()
+
+        except Exception, e:
+            records = None
+            logging.exception("Can't get a result from mysql. %s"%(cmd))
+
+        if cursor!=None: cursor.close()
+        if db!=None: db.close()
+
+        return records
+
+    def selectDirectly(property, cmd=None):
+        db = None
+        cursor = None
+        records = None
+
+        if cmd == None: return None
+
+        try:
+            dbhost = property['HOST']
+            dbport = property['PORT']
+            dbuser = property['USER']
+            dbpass = property['PASS']
+            dbname = property['NAME']
+
+            db = MySQLdb.connect(host=dbhost, port=dbport, user=dbuser, passwd=dbpass, db=dbname)
+            cursor = db.cursor(MySQLdb.cursors.DictCursor)
+            cursor.execute('set names utf8')
+            cursor.execute(cmd)
+            records = cursor.fetchall()
+
+        except Exception, e:
+            records = None
+            logging.exception("Can't get a result from mysql. %s"%(cmd))
+
+        if cursor!=None: cursor.close()
+        if db!=None: db.close()
+
+        return records
+    selectDirectly = staticmethod(selectDirectly)
+
+#======================================================================================================
+class GatheringHandler(Thread):
+    def __init__(self, parent, host, now):
+        Thread.__init__(self)
+        self.parent = parent
+        self.host = host
+        self.now = now
+        self.property = parent.property
+        self.cmode = self.property.mainMap["COLLECTION_MODE"] # testmode or realmode, 수집 방식 정의
+        self.rmode = self.property.hostMap[host]["RUNMODE"] # agent or dbanget, Agent의 타입
+        self.client = None
+        self.isRunning = True
+
+    def write2file(self, filepath, data):
+        f = open(filepath, "w")
+        f.write(data)
+        f.close()
+
+    def run(self):
+        try:
+            rawdata = ''
+            hostname = self.property.hostMap[self.host]["SERVER"]
+            port = self.property.mainMap["PORT"]
+
+
+            logging.debug("S Job - %s, %s"%(self.host, hostname))
+
+            self.client = socket(AF_INET, SOCK_STREAM)
+            self.client.connect((hostname, port))
+
+            # send command
+            self.client.send("%s %s[^END]"%(self.cmode, self.now))
+            sys.stdout.flush()
+            
+            # receive data
+            while self.isRunning:
+                buf = self.client.recv(2048)
+                if not buf: break
+                rawdata += buf
+                if rawdata.rstrip('\r\n')[-6:] == '[^END]':
+                    #logging.debug("R Data - %s"%(self.host))
+
+                    realdata = rawdata.rstrip('\r\n')[:-6]
+                    
+                    if len(self.now)!=14: break 
+                   
+                    if self.property.mainMap["SAVE_COLLECTED_DATA"].lower() =="yes":
+                        savedir = "%s/%s"%(self.property.mainMap["REMOTE_DATA_PATH"], self.host)
+                        if not os.path.exists(savedir):
+                            os.mkdir(savedir)
+
+                        logging.debug("W File - %s"%(self.host))
+                        self.write2file("%s/%s"%(savedir, self.now[8:]), realdata)
+
+                    itemdata, smsdata = self.parseData(realdata)
+                    if len(itemdata) == 0:
+                        self.saveDefaultData()
+
+                        if self.cmode =="REALMODE":
+                            if self.host in self.parent.restartmap:
+                                self.parent.restartmap[self.host] = self.parent.restartmap[self.host] + 1
+                            else:
+                                self.parent.restartmap[self.host] = 1
+
+                            restart = self.parent.restartmap[self.host]
+                            logging.warning("data is empty - (%d) %s"%(restart, self.host))
+
+                            if (restart%3) == 0:
+                                self.restartSysmonAgnet(KILL_AND_RESTART)
+
+                            self.checkEmptydataHost()
+                    else:
+                        self.saveReceviedData(itemdata)
+                        self.checkAlert(smsdata)
+
+                        self.parent.restartmap[self.host] = 0
+                        self.resetEmptydataHost()
+                    break
+
+            self.close()
+            self.resetShutdownHost()
+
+            logging.debug("E Job - %s"%(self.host))
+
+        except Exception, e:
+            try:
+                logging.error("S exception - %s"%(self.host))
+
+                if str(e).find("Connection refused")>=0:
+                    logging.error("Except Connection refused - %s"%(self.host))
+                    self.saveDefaultData()
+
+                    response = self.checkSysmonAgent()
+                    if response == RESPONSE_NOT_INSTALLED:
+                        self.InstallSysmonAgent()
+
+                    elif response == RESPONSE_INSTALLED:
+                        self.restartSysmonAgnet(JUST_RESTART)
+
+                    else:
+                        self.checkShutdownHost()
+
+                elif str(e).find("timed out")>=0:
+                    logging.error("Except Connection timed out - %s"%(self.host))
+                    self.saveDefaultData()
+
+                    self.checkShutdownHost()
+
+                elif str(e).find("Connection reset")>=0:
+                    logging.error("Except Connection reset by peer - %s"%(self.host))
+                    self.saveDefaultData()
+
+                    self.checkShutdownHost()
+                    self.restartSysmonAgnet(KILL_AND_RESTART)
+
+                elif str(e).find("No route to host")>=0:
+                    logging.error("Except No route to host - %s"%(self.host))
+                    self.saveDefaultData()
+
+                    self.checkShutdownHost()
+
+                elif str(e).find("Operation already in progress")>=0:
+                    logging.error("Operation already in progress - %s"%(self.host))
+                    self.saveDefaultData()
+
+                #elif str(e).find("Operation already in progress")>=0:
+
+                else:
+                    logging.exception("Unknown exception : %s"%(self.host))
+
+                self.close()
+
+                logging.error("E exception - %s"%(self.host))
+                
+            except Exception, ex:
+                self.close()
+                logging.exception("In Exception : %s"%(self.host))
+              
+    def checkSysmonAgent(self):
+        command = ""
+        checkcommand = ""
+
+        if self.cmode == "TESTMODE": return
+
+        hostname = self.property.hostMap[self.host]["SERVER"]
+        options = "-q -o NumberOfPasswordPrompts=0 -o ConnectTimeout=10"
+
+        if self.property.hostMap[self.host]["OS"].find("window") >= 0: # window, windows
+            if 'SSH_WINDOWS_CHECK_PROGRAM' in self.property.mainMap and self.property.mainMap["SSH_WINDOWS_CHECK_PROGRAM"] <> "":
+                checkcommand = self.property.mainMap["SSH_WINDOWS_CHECK_PROGRAM"]
+        else:
+            if 'SSH_LINUX_CHECK_PROGRAM' in self.property.mainMap and self.property.mainMap["SSH_LINUX_CHECK_PROGRAM"] <> "":
+                checkcommand = self.property.mainMap["SSH_LINUX_CHECK_PROGRAM"]
+
+        if checkcommand == "":
+            return RESPONSE_INSTALLED
+
+        command = '''ssh %s %s "%s"'''%(hostname, options, checkcommand)
+
+        handle = os.popen(command)
+        lines = handle.readlines()
+        handle.close()
+
+        response = " ".join(lines).strip(" \n\r")
+        logging.info("%s, %s"%(command, response))
+
+        return response
+            
+
+    def InstallSysmonAgent(self):
+        """
+        한번에 너무 많이 설치가 되면 부하가 생길수 있기 때문에
+        동시에 200개 이상 설치가 안되록 함
+
+        또한 동일 서버도 5분 안에 다시 설치가 안되도록 함
+        """
+
+        command = ""
+        installcommand = ""
+
+        if self.cmode == "TESTMODE": return
+
+        if len(self.parent.setupTicket) > 200 or self.host in self.parent.setupTicket:
+            logging.info("%s - no ticket or setup is not finished"%self.host) 
+            return
+        else:
+            self.parent.setupTicket[self.host] = 5
+
+        logging.info("%s - setup started."%self.host) 
+        hostname = self.property.hostMap[self.host]["SERVER"]
+
+        if self.property.hostMap[self.host]["OS"].find("window") >= 0: # window, windows
+            if 'SSH_WINDOWS_INSTALL_PROGRAM' in self.property.mainMap and self.property.mainMap["SSH_WINDOWS_INSTALL_PROGRAM"] <> "":
+                installcommand = self.property.mainMap["SSH_WINDOWS_INSTALL_PROGRAM"]
+        else:
+            if 'SSH_LINUX_INSTALL_PROGRAM' in self.property.mainMap and self.property.mainMap["SSH_LINUX_INSTALL_PROGRAM"] <> "":
+                installcommand = self.property.mainMap["SSH_LINUX_INSTALL_PROGRAM"]
+
+        if installcommand <> "":
+            command = '''%s %s 1> /dev/null 2>/dev/null'''%(installcommand, hostname)
+
+            handle = os.popen(command)
+            lines = handle.readlines()
+            handle.close()
+
+            logging.info("%s"%(command))
+
+    def parseData(self, data):
+        smsdata = {}
+        itemdata = []
+        lines = data.split('\n')
+
+        if self.rmode == RUNMODE_AGENT:
+
+            for line in lines:
+                if line=="": continue
+
+                temp = line.split(",", 2)
+                if len(temp) == 2:
+                    name = temp[0].strip()
+                    value = temp[1].strip(' \n\r')
+
+                    if name.startswith('sms'):
+                        smsdata[name] = value
+                    else:
+                        itemdata.append(temp)
+
+        elif self.rmode == RUNMODE_DBAGENT:
+
+            for line in lines:
+                if line=="": continue
+
+                temp = line.split(",", 3)
+
+                if len(temp) == 2:
+                    itemdata.append(temp)
+                else:
+                    host = temp[0].strip()
+                    name = temp[1].strip()
+                    value = temp[2].strip(' \n\r')
+
+                    """
+                    현재 DBAGENT의 SMS는 지원하지 않고 있습니다."
+                    ANDROMEDA를 통한 SMS로 통합되어짐
+                    """
+                    if name.startswith('sms'):
+                        if host in smsdata:
+                            smsdata[host][name] = value
+                        else:
+                            smsdata[host] = { name : value }
+                    else:
+                        itemdata.append(temp)
+
+        else:
+            raise Exception, "Unknown runmode - %s"%(self.host)
+
+
+        return itemdata, smsdata
+
+    def restartSysmonAgnet(self, isKill):
+        command = ""
+
+        if self.cmode == "TESTMODE": return
+
+        hostname = self.property.hostMap[self.host]["SERVER"]
+        options = "-q -o NumberOfPasswordPrompts=0 -o ConnectTimeout=10"
+
+        if self.property.hostMap[self.host]["OS"].find("window") >= 0: # window, windows
+            if isKill:
+                if 'SSH_WINDOWS_RESTART' in self.property.mainMap and self.property.mainMap["SSH_WINDOWS_RESTART"] <> "":
+                    command = '''ssh %s %s "%s"'''%(hostname, options, self.property.mainMap["SSH_WINDOWS_RESTART"])
+            else:
+                if 'SSH_WINDOWS_START' in self.property.mainMap and self.property.mainMap["SSH_WINDOWS_START"] <> "":
+                    command = '''ssh %s %s "%s"'''%(hostname, options, self.property.mainMap["SSH_WINDOWS_START"])
+        else:
+            if isKill:
+                if 'SSH_LINUX_RESTART' in self.property.mainMap and self.property.mainMap["SSH_LINUX_RESTART"] <> "":
+                    command = '''ssh %s %s "%s"'''%(hostname, options, self.property.mainMap["SSH_LINUX_RESTART"])
+            else:
+                if 'SSH_LINUX_START' in self.property.mainMap and self.property.mainMap["SSH_LINUX_START"] <> "":
+                    command = '''ssh %s %s "%s"'''%(hostname, options, self.property.mainMap["SSH_LINUX_START"])
+
+        if command <> "":
+            handle = os.popen(command)
+            lines = handle.readlines()
+            handle.close()
+            logging.info("%s, %s"%(command, ' '.join(lines)))
+
+    def checkEmptydataHost(self):
+        try:
+            if self.cmode == "TESTMODE": return
+            if self.rmode <> RUNMODE_AGENT: return
+
+            for key, data in self.property.alertMap.items():
+                if data['check process'].startswith('sms(emptydata') and  self.host in data['servers']:
+                    data['servers'][self.host] = data['servers'][self.host] + 1
+                    logging.info("%s - %s count: %d"%(self.host, key, data['servers'][self.host]))
+
+                    if self.checkHost(key, data):
+                        logging.info("%s - Send SMS(%s)"%(self.host, key))
+                        data['servers'][self.host] = 0
+                        self.markHost(key, MARK_ON)
+                        self.sendSMS(key, data)
+        except:
+            logging.exception("%s : Cannot check emptydata severs"%(self.host))
+
+    def resetEmptydataHost(self):
+        if self.cmode == "TESTMODE": return
+        if self.rmode <> RUNMODE_AGENT: return
+
+        for key, data in self.property.alertMap.items():
+            if data['check process'].startswith('sms(emptydata') and  self.host in data['servers']:
+                self.markHost(key, MARK_OFF)
+                data['servers'][self.host] = 0
+
+    def checkShutdownHost(self):
+        try:
+            if self.cmode == "TESTMODE": return
+            if self.rmode <> RUNMODE_AGENT: return
+
+            for key, data in self.property.alertMap.items():
+                if data['check process'].startswith('sms(shutdown') and  self.host in data['servers']:
+                    data['servers'][self.host] = data['servers'][self.host] + 1
+                    logging.info("%s - %s count: %d"%(self.host, key, data['servers'][self.host]))
+
+                    if self.checkHost(key, data):
+                        logging.info("%s - Send SMS(%s)"%(self.host, key))
+                        data['servers'][self.host] = 0
+                        self.markHost(key, MARK_ON)
+                        self.sendSMS(key, data)
+        except:
+            logging.exception("%s : Cannot check shutdown severs"%(self.host))
+
+
+    def resetShutdownHost(self):
+        if self.cmode == "TESTMODE": return
+        if self.rmode <> RUNMODE_AGENT: return
+
+        for key, data in self.property.alertMap.items():
+            if data['check process'].startswith('sms(shutdown') and  self.host in data['servers']:
+                self.markHost(key, MARK_OFF)
+                data['servers'][self.host] = 0
+
+    def checkAlert(self, smsdata):
+        alertkey = ""
+        try:
+            if self.cmode == "TESTMODE": return
+            if self.rmode <> RUNMODE_AGENT: return
+
+            for key, data in self.property.alertMap.items():
+                # handled by checkShutdownHost
+                if data['check process'].startswith('sms(shutdown'):
+                    continue
+                # handled by checkEmptydataHost
+                if data['check process'].startswith('sms(emptydata'):
+                    continue
+
+                alertkey = key
+
+                if self.host in data['servers']:
+                    procname = data['check process']
+                    if not procname in smsdata:
+                        logging.error("%s - %s is not exist alert.conf"%(self.host, procname))
+                        continue
+
+                    value = smsdata[procname]
+
+                    if eval(data['errorcheck']):
+                        data['servers'][self.host] = data['servers'][self.host] + 1
+
+                        if self.checkHost(key, data):
+                            #print "%s, check process : %s"%(self.host, procname)
+                            data['servers'][self.host] = 0
+                            self.markHost(key, MARK_ON)
+                            self.sendSMS(key, data)
+                    else:
+                        self.markHost(key, MARK_OFF)
+                        data['servers'][self.host] = 0
+
+        except Exception, e:
+            # when alert.conf servers_info, name_info .. <> monitor.conf
+            logging.exception("%s - alert.conf is incorrect for host : %s"%(self.host, alertkey))
+
+    def checkHost(self, key, data):
+        errcount = data['servers'][self.host]
+        file = "%s/%s/%s"%(ALERT_STATE_DIR, key, self.host)
+        isErrorHost = (data['servers'][self.host] >= data['errortimes'] and not os.path.exists(file))
+
+        logging.info("%s : %s - current : %d, threshold : %d, marked=%s, is error=%s"%(self.host, key, errcount, data['errortimes'], os.path.exists(file), isErrorHost))
+        return isErrorHost
+
+    def markHost(self, key, flag):
+        file = "%s/%s/%s"%(ALERT_STATE_DIR, key, self.host)
+
+        try :
+            if flag:
+                logging.info("%s, %s Mark On/Off flag of servers : %s"%(self.host, key, str(flag)))
+                self.write2file(file, self.now)
+            else:
+                if os.path.exists(file):
+                    os.remove(file)
+
+        except:
+            logging.exception("%s - cannot mark a host, %"%(self.host, key))
+
+    def sendSMS(self, key, data):
+        f=None
+        try:
+            sender = self.property.mainMap["SMS_SENDER"].strip(" \n\r")
+
+            if sender == "":
+                raise Exception, "SMS Sender is empty"
+
+            if self.host in self.property.alertholdMap:
+                logging.info("%s is sms blacklist."%(self.host))
+                return
+
+            service = None
+            function = None
+            if self.host in self.property.hostMap:
+                service = self.property.hostMap[self.host]["SERVICE"]
+                function =  self.property.hostMap[self.host]["FUNCTION"]
+
+            receivers = data['mobile']
+            message = "%s\n%s\n* Sysmon Warn *\n" %(sender, ' '.join(receivers))
+            message = "%sHOST:%s\n" %(message, self.host)
+            if service and function:
+                message = "%s:%s\n" %(message, service)
+                message = "%s:%s\n" %(message, function)
+
+            if 'message' in data.keys():
+                message = "%sMSG:%s"%(message, data['message'].replace("CRLF", "\n"))
+            else:
+                message = "%sMSG:%s"%(message, key)
+
+            nowtime = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time()))
+            file = "%s/%s-%s-%s"%(SMS_POOL_DIR, nowtime, self.host, key.replace(" ", ""))
+            f=open(file,"wb")
+            f.write(message)
+            f.close()
+
+        except Exception, e:
+            if f: f.close()
+            logging.exception("Cannot send a SMS Message.");
+
+    def saveDefaultData(self):
+        db = DB(self.property.mainMap["SYSMONDB"])
+        hostping = None
+        hostlist = []
+        didlist = []
+        currentlist = []
+        historylist = []
+
+        if self.rmode == RUNMODE_AGENT:
+            isalive = int(self.property.mainMap["ITEM_ID_AGENT_ISALIVE"])
+            didlist.append(str(isalive))
+
+            if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                hostping = self.property.mainMap["ITEM_ID_HOSTPING"]
+                didlist.append(str(hostping))
+                if self.ping(): response = '100'
+                else: response = '0'
+
+            if self.property.mainMap["IS_DUALMODE"]:
+                db.execute("DELETE FROM CURRENT WHERE HOST='%s' AND DID in (%s)"%(self.host, ','.join(didlist)))
+            else:
+                db.execute("DELETE FROM CURRENT WHERE HOST='%s'"%(self.host))
+
+            currentlist.append((self.host, isalive, self.now, '0'))
+            historylist.append((self.host, isalive, self.now, '0', '0', '0'))
+
+            if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                currentlist.append((self.host, hostping, self.now, response))
+                historylist.append((self.host, hostping, self.now, response, response, response))
+
+            db.executeAll("INSERT INTO CURRENT (HOST, DID, TIME, AVG) VALUES (%s, %s, %s, %s)", tuple(currentlist))
+            db.executeAll("INSERT INTO HISTORY (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)", tuple(historylist))
+
+            if self.parent.andromeda:
+                self.parent.andromeda.checkCondition(self.host, isalive, '0')
+
+                if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                    self.parent.andromeda.checkCondition(self.host, hostping, response)
+
+        else:
+            isalive = int(self.property.mainMap["ITEM_ID_DBAGENT_ISALIVE"])
+
+            hosts = self.property.agentMap[self.host]
+            for host in hosts:
+                currentlist.append((host, isalive, self.now, '0'))
+                historylist.append((host, isalive, self.now, '0', '0', '0'))
+                hostlist.append("'%s'"%(host))
+
+            """
+            DBAgent가 죽을 경우
+            해당 DB AGENT만 죽었다고 SMS가 발송되도록 함
+            """
+            if self.parent.andromeda and 'ITEM_ID_DBAGENT_REACHABLE' in self.property.mainMap:
+                reachable = int(self.property.mainMap["ITEM_ID_DBAGENT_REACHABLE"])
+                self.parent.andromeda.checkCondition(self.host, reachable, '0')
+
+            if self.property.mainMap["IS_DUALMODE"]:
+                db.execute("DELETE FROM CURRENT WHERE HOST in (%s) AND DID='%d'"%(','.join(hostlist), isalive))
+            else:
+                db.execute("DELETE FROM CURRENT WHERE HOST in (%s)"%(','.join(hostlist)))
+
+            db.executeAll("INSERT INTO CURRENT (HOST, DID, TIME, AVG) VALUES (%s, %s, %s, %s)", tuple(currentlist))
+            db.executeAll("INSERT INTO HISTORY (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)", tuple(historylist))
+
+    def saveReceviedData(self, data):
+        if self.rmode == RUNMODE_AGENT:
+            self.save2db(data)
+        else:
+            self.savedb2db(data)
+
+    def save2db(self, data):
+        currentlist = []
+        historylist = []
+        hostlist = []
+        timelist = []
+        didlist = []
+        savetime = None
+        db = DB(self.property.mainMap["SYSMONDB"])
+
+        isalive = int(self.property.mainMap["ITEM_ID_AGENT_ISALIVE"])
+
+        if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+            hostping = self.property.mainMap["ITEM_ID_HOSTPING"]
+
+        for temp in data:
+            if len(temp) <> 2:
+                continue
+
+            name = temp[0]
+            value = temp[1]
+
+            if name == "S":
+                savetime = value 
+
+                hostlist.append(self.host)
+                if savetime == self.now:
+                    currentlist.append((self.host, isalive, savetime, '100'))
+                    didlist.append(str(isalive))
+
+                    # save ping test result
+                    if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                        currentlist.append((self.host, hostping, savetime, '100'))
+                        didlist.append(str(hostping))
+            
+                    # Mymon 용도 ==================================================================
+                    if self.property.duplicatedHostMap:
+                        server = self.property.hostMap[self.host]["SERVER"]
+                        if len(self.property.duplicatedHostMap[server]) > 1:
+
+                            for host in self.property.duplicatedHostMap[server]:
+                                if host == self.host: continue
+                                hostlist.append(host)
+                                currentlist.append((host, isalive, savetime, '100'))
+
+                                # save ping test result
+                                if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                                    currentlist.append((host, hostping, savetime, '100'))
+                    # Mymon 용도 ==================================================================
+                        
+
+                timelist.append(savetime)
+
+                historylist.append((self.host, isalive, savetime, '100', '100', '100'))
+
+                # save ping test result
+                if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                    historylist.append((self.host, hostping, savetime, '100', '100', '100'))
+            
+                # Mymon 용도 ==================================================================
+                if self.property.duplicatedHostMap:
+                    server = self.property.hostMap[self.host]["SERVER"]
+                    if len(self.property.duplicatedHostMap[server]) > 1:
+                        for host in self.property.duplicatedHostMap[server]:
+                            if host == self.host: continue
+                            historylist.append((host, isalive, savetime, '100', '100', '100'))
+
+                            # save ping test result
+                            if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                                historylist.append((host, hostping, savetime, '100', '100', '100'))
+                # Mymon 용도 ==================================================================
+
+                if self.parent.andromeda:
+                    self.parent.andromeda.checkCondition(self.host, isalive, '100')
+
+                    if self.property.mainMap["USE_HOSTPING"].lower() == "yes":
+                        self.parent.andromeda.checkCondition(self.host, hostping, '100')
+
+            elif name == "E":
+                pass
+
+            else:
+                # item = [did, name, type, unit, default]
+                datainfo = self.property.itemMap["NAME"].get(name)
+
+                if datainfo != None:
+                    id = datainfo[0]
+
+                    if savetime == self.now:
+                        if id==8002 or id==8012 or id==8013 or id==8020:
+                            currentlist.append((self.host, id, savetime, self.getSpecialData(self.host, value)))
+                        else:
+                            currentlist.append((self.host, id, savetime, value))
+                        didlist.append(str(id))
+                        
+                        # Mymon 용도 ==================================================================
+                        if self.property.duplicatedHostMap:
+                            server = self.property.hostMap[self.host]["SERVER"]
+                            if len(self.property.duplicatedHostMap[server]) > 1:
+                                for host in self.property.duplicatedHostMap[server]:
+                                    if host == self.host: continue
+                                    if id==8002 or id==8012 or id==8013 or id==8020:
+                                        currentlist.append((host, id, savetime, self.getSpecialData(host, value)))
+                                    else:
+                                        currentlist.append((host, id, savetime, value))
+                        # Mymon 용도 ==================================================================
+
+
+                    if id==8002 or id==8012 or id==8013 or id==8020:
+                        tmp = self.getSpecialData(self.host, value)
+                        historylist.append((self.host, id, savetime, tmp, tmp, tmp))
+                    else:
+                        historylist.append((self.host, id, savetime, value, value, value))
+
+                    # Mymon 용도 ==================================================================
+                    if self.property.duplicatedHostMap:
+                        server = self.property.hostMap[self.host]["SERVER"]
+                        if len(self.property.duplicatedHostMap[server]) > 1:
+                            for host in self.property.duplicatedHostMap[server]:
+                                if host == self.host: continue
+                                if id==8002 or id==8012 or id==8013 or id==8020:
+                                    tmp = self.getSpecialData(host, value)
+                                    historylist.append((host, id, savetime, tmp, tmp, tmp))
+                                else:
+                                    historylist.append((host, id, savetime, value, value, value))
+                    # Mymon 용도 ==================================================================
+
+                    if self.parent.andromeda:
+                        if id==8002 or id==8012 or id==8013 or id==8020:
+                            self.parent.andromeda.checkCondition(self.host, id, self.getSpecialData(self.host, value))
+                        else:
+                            self.parent.andromeda.checkCondition(self.host, id, value)
+
+                else:
+                    logging.error("%s : can't find id of %s from db."%(self.host, name))
+
+        hosts = []
+        for host in hostlist:
+            hosts.append("'%s'"%(host))
+
+        if self.property.mainMap["IS_DUALMODE"]:
+            logging.debug("DELETE FROM CURRENT WHERE HOST IN (%s) AND DID in (%s)"%(','.join(hosts), ','.join(didlist)))
+            db.execute("DELETE FROM CURRENT WHERE HOST IN (%s) AND DID in (%s)"%(','.join(hosts), ','.join(didlist)))
+            #logging.debug("DELETE FROM CURRENT WHERE HOST='%s' AND DID in (%s)"%(self.host, ','.join(didlist)))
+            #db.execute("DELETE FROM CURRENT WHERE HOST='%s' AND DID in (%s)"%(self.host, ','.join(didlist)))
+            if len(timelist)>1:
+                #logging.debug("DELETE FROM HISTORY WHERE HOST='%s' AND TIME in (%s) AND DID in (%s)"%(self.host, ','.join(timelist), ','.join(didlist)))
+                #db.execute("DELETE FROM HISTORY WHERE HOST='%s' AND TIME in (%s) AND DID in (%s)"%(self.host, ','.join(timelist), ','.join(didlist)))
+                db.execute("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME in (%s) AND DID in (%s)"%(','.join(hosts), ','.join(timelist), ','.join(didlist)))
+        else:
+            logging.debug("DELETE FROM CURRENT WHERE HOST IN (%s)"%(','.join(hosts)))
+            db.execute("DELETE FROM CURRENT WHERE HOST IN (%s)"%(','.join(hosts)))
+            #logging.debug("DELETE FROM CURRENT WHERE HOST='%s'"%(self.host))
+            #db.execute("DELETE FROM CURRENT WHERE HOST='%s'"%(self.host))
+            if len(timelist)>1:
+                #db.execute("DELETE FROM HISTORY WHERE HOST='%s' AND TIME in (%s)"%(self.host, ','.join(timelist)))
+                db.execute("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME in (%s)"%(','.join(hosts), ','.join(timelist)))
+
+        db.executeAll("INSERT INTO CURRENT (HOST, DID, TIME, AVG) VALUES (%s, %s, %s, %s)", tuple(currentlist))
+        db.executeAll("INSERT INTO HISTORY (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)", tuple(historylist))
+
+    def getSpecialData(self, host, rowdata):
+        set = {}
+        serverport = "*"
+        value = "0"
+
+        try:
+            serverinfo = host.split(":")
+            if len(serverinfo)==2:
+                serverport = serverinfo[1]
+
+            if rowdata:
+                items = rowdata.split()
+                for item in items:
+                    temps = item.split(":")
+                    k=temps[0]
+                    v=temps[1]
+                    set[k] = v
+
+                if serverport in set:
+                    value = set[serverport]
+                    #logging.debug("%s : find '%s' port data - %s in map - %s"%(host, serverport, value, rowdata))
+                elif "*" in set:
+                    value = set["*"]
+                    logging.error("%s : Cannot find '%s' port data in map - %s"%(host, serverport, rowdata))
+                else:
+                    value = "0"
+
+        except:
+            logging.exception("%s : Cannot make value map - %s"%(host, rowdata))
+
+        return value
+
+    def savedb2db(self, data):
+        currentlist = []
+        historylist = []
+        hostlist = []
+        timelist = []
+        didlist = []
+        savetime = None
+        db = DB(self.property.mainMap["SYSMONDB"])
+
+
+        for temp in data:
+            if len(temp) == 2:
+
+                name = temp[0]
+                value = temp[1].strip(" \n\r")
+
+                if name == "S":
+                    savetime = value 
+
+                    timelist.append(savetime)
+
+                elif name == "E":
+                    pass
+                else:
+                    logging.error("Data format is wrong. %s"%str(temp))
+
+            elif len(temp) == 3:
+                host = temp[0]
+                did = int(temp[1])
+                value = temp[2].strip(" \n\r")
+
+                if not host in self.property.agentMap[self.host]:
+                    #logging.debug("%s is not a member of %s dbagent"%(host, self.host))
+                    continue
+
+                if not host in hostlist:
+                    hostlist.append(host)
+
+                # item = [did, name, type, unit, default]
+                datainfo = self.property.itemMap["ID"].get(did)
+                if datainfo != None:
+                    if value == "": value = datainfo[4]
+
+                    if savetime == self.now:
+                        currentlist.append((host, did, savetime, value))
+                        didlist.append(str(did))
+
+                    historylist.append((host, did, savetime, value, value, value))
+
+                    if self.parent.andromeda:
+                        self.parent.andromeda.checkCondition(host, did, value)
+                else:
+                    #logging.warning("%s : can't find a did from db. did=%s"%(self.host, did))
+                    pass
+            
+
+        hosts = []
+        if len(didlist)>0:
+            didlist = list(Set(didlist))
+
+        for host in hostlist:
+            hosts.append("'%s'"%(host))
+
+        if self.property.mainMap["IS_DUALMODE"]:
+            logging.debug("DELETE FROM CURRENT WHERE HOST IN (%s) AND DID IN (%s)"%(','.join(hosts), ','.join(didlist)))
+            db.execute("DELETE FROM CURRENT WHERE HOST IN (%s) AND DID IN (%s)"%(','.join(hosts), ','.join(didlist)))
+
+            if len(timelist)>0:
+                logging.debug("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME IN (%s) AND DID IN (%s)"%(','.join(hosts), ','.join(timelist), ','.join(didlist)))
+                db.execute("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME IN (%s) AND DID IN (%s)"%(','.join(hosts), ','.join(timelist), ','.join(didlist)))
+        else:
+            logging.debug("DELETE FROM CURRENT WHERE HOST IN (%s)"%(','.join(hosts)))
+            db.execute("DELETE FROM CURRENT WHERE HOST IN (%s)"%(','.join(hosts)))
+
+            if len(timelist)>0:
+                logging.debug("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME IN (%s)"%(','.join(hosts), ','.join(timelist)))
+                db.execute("DELETE FROM HISTORY WHERE HOST IN (%s) AND TIME IN (%s)"%(','.join(hosts), ','.join(timelist)))
+
+        #print "INSERT INTO CURRENT (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)", tuple(currentlist)
+        db.executeAll("INSERT INTO CURRENT (HOST, DID, TIME, AVG) VALUES (%s, %s, %s, %s)", tuple(currentlist))
+        db.executeAll("INSERT INTO HISTORY (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)", tuple(historylist))
+
+    def close(self):
+        self.isRunning = False
+        if self.client:
+            self.client.close()
+        else:
+            logging.dubug("not null"%(self.host))
+
+    def ping(self):
+        try:
+            hostname = self.property.hostMap[self.host]["SERVER"]
+            lifeline = re.compile(r"(\d) received")
+            #report = ("no response","partial response","alive", "error")
+            report = (False,True,True,False)
+
+            handle = os.popen("ping -q -c2 %s 2> /dev/null"%(hostname))
+            lines = handle.readlines()
+            handle.close()
+            igot = re.findall(lifeline,'\n'.join(lines))
+            if igot:
+                logging.debug("%s is alive."%(self.host))
+                return report[int(igot[0])]
+            else:
+                logging.debug("%s is shutdown."%(self.host))
+                return report[3]
+        except:
+            logging.exception("%s - ping error"%(self.host))
+
+        
+    	
+class HistoryJob(Thread):
+    def __init__(self, property):
+        Thread.__init__(self)
+        self.db = DB(property.mainMap["SYSMONDB"])
+        self.isRunning = True
+        self.configList = []
+        self.actionMap = dict()
+        self.property = property
+
+    def initMap(self):
+        try:
+            records = self.db.select("SELECT PERIOD, TBLNAME, GRAPHCYCLE, TABLECYCLE, REFTBL FROM HISTORY_CONF ORDER BY PERIOD")
+    
+            self.actionMap.clear()
+            self.configList = []
+    
+            for record in records:
+                period = int(record['PERIOD'])
+                tblname = record['TBLNAME']
+                graphcycle = int(record['GRAPHCYCLE'])
+                tablecycle = int(record['TABLECYCLE'])
+                reftbl = record['REFTBL']
+
+                cycle = period * graphcycle * tablecycle
+                self.configList.append([period, tblname, cycle, reftbl])
+                # default time is YYYY-MM-DD 09:00:00 
+                # that's why time + 32400 
+                self.actionMap[tblname] = (int(time.time())-60+32400)/(period*60)
+
+                self.createCurrentTbl()
+                self.createHistoryTbl(tblname)
+
+            #logging.debug(self.configList)
+            #logging.debug(self.actionMap)
+        except Exception, e:
+            logging.exception("Cannot get History Conf Table")
+
+    def createCurrentTbl(self):
+        sql = "CREATE TABLE IF NOT EXISTS `CURRENT` ("
+        sql = "%s TIME timestamp NOT NULL,"%(sql)
+        sql = "%s HOST varchar(64) NOT NULL,"%(sql)
+        sql = "%s DID int(11) NOT NULL,"%(sql)
+        sql = "%s AVG varchar(1024) NOT NULL,"%(sql)
+        sql = "%s PRIMARY KEY  (HOST, DID),"%(sql)
+        sql = "%s KEY (DID)"%(sql)
+        sql = "%s )ENGINE=InnoDB DEFAULT CHARSET=utf8;"%(sql)
+
+        logging.debug(sql)
+        self.db.execute(sql)
+
+    def createHistoryTbl(self, tblname):
+        sql = "CREATE TABLE IF NOT EXISTS %s ("%(tblname)
+        sql = "%s TIME timestamp NOT NULL,"%(sql)
+        sql = "%s HOST varchar(64) NOT NULL,"%(sql)
+        sql = "%s DID int(11) NOT NULL,"%(sql)
+        sql = "%s AVG varchar(1024) NOT NULL,"%(sql)
+        sql = "%s MAX varchar(1024) NOT NULL,"%(sql)
+        sql = "%s MIN varchar(1024) NOT NULL,"%(sql)
+        sql = "%s PRIMARY KEY  (TIME, HOST, DID)"%(sql)
+        sql = "%s )ENGINE=InnoDB DEFAULT CHARSET=utf8;"%(sql)
+
+        logging.debug(sql)
+        self.db.execute(sql)
+
+    def deleteCurrentTbl(self, deltime):
+        self.db.execute("DELETE FROM CURRENT WHERE TIME < " + deltime)
+
+    def deleteHistoryTbl(self, tblname, nowtime, cycle):
+        hours = datetime.timedelta(minutes=cycle)
+        deltime = (nowtime-hours).strftime("%Y%m%d%H%M00")
+
+	    #logging.debug("DELETE FROM " + tblname + " WHERE TIME < " + deltime)
+        self.db.execute("DELETE FROM " + tblname + " WHERE TIME < " + deltime)
+
+    def getHistoryData(self, tblname, reftbl, nowtime, period):
+
+        servers = self.property.allHostsMap.keys()
+        total = len(servers)
+
+        start = 0
+        while start < total:
+            serverpart = servers[start:start+100]
+            self.compressHistoryData(tblname, reftbl, nowtime, period, tuple(serverpart))
+            start += 100
+
+
+    def compressHistoryData(self, tblname, reftbl, nowtime, period, serverpart):
+        list = []
+        timelist = []
+
+        #minutes = datetime.timedelta(minutes=period)
+        #fromtime = (nowtime-minutes).strftime("%Y%m%d%H%M00")
+        totime = nowtime.strftime("%Y%m%d%H%M00")
+
+        for index in range(1, period+1):
+            minutes = datetime.timedelta(minutes=index)
+            timelist.append((nowtime-minutes).strftime("%Y-%m-%d %H:%M:00"))
+
+        wheretime = tuple(timelist)
+
+        sql = "SELECT A.HOST, A.DID, ROUND(AVG(A.AVG),2) AS AVG, MAX(A.AVG) AS MAX, MIN(A.AVG) AS MIN FROM %s A, DATA_INFO B "%(reftbl)
+        sql = "%s WHERE A.TIME IN %s AND A.HOST IN %s AND A.DID=B.DID AND B.TYPE <> 'string' GROUP BY A.HOST, A.DID"%(sql, wheretime, serverpart)
+        #sql = "%s WHERE A.TIME >= %s AND A.TIME < %s AND A.HOST IN %s AND A.DID=B.DID AND B.TYPE <> 'string' GROUP BY A.HOST, A.DID"%(sql, fromtime, totime, serverpart)
+
+        logging.info(sql)
+
+        records = self.db.select(sql)
+
+        if records == None: return
+
+        for record in records:
+            host = record['HOST']
+            did = int(record['DID'])
+            avg = str(record['AVG'])
+            max = str(record['MAX'])
+            min = str(record['MIN'])
+            #print "HOST=%s, DID=%d, AVER=%s"%(host, did, value)
+            list.append((host, did, totime, avg, max, min))
+
+        sql = "SELECT A.HOST, A.DID, A.AVG AVG, A.AVG AS MAX, A.AVG AS MIN FROM %s A, DATA_INFO B "%(reftbl)
+        sql = "%s WHERE A.TIME IN %s AND A.HOST IN %s AND A.DID=B.DID AND B.TYPE = 'string' GROUP BY A.HOST, A.DID"%(sql, wheretime, serverpart)
+        #sql = "%s WHERE A.TIME >= %s AND A.TIME < %s AND A.HOST IN %s AND A.DID=B.DID AND B.TYPE = 'string' GROUP BY A.HOST, A.DID"%(sql, fromtime, totime, serverpart)
+        records = self.db.select(sql)
+
+        if records == None: return
+
+        for record in records:
+            host = record['HOST']
+            did = int(record['DID'])
+            avg = str(record['AVG'])
+            max = str(record['MAX'])
+            min = str(record['MIN'])
+            #print "HOST=%s, DID=%d, AVER=%s"%(host, did, value)
+            list.append((host, did, totime, avg, max, min))
+
+        query = "INSERT INTO " + tblname + " (HOST, DID, TIME, AVG, MAX, MIN) VALUES (%s, %s, %s, %s, %s, %s)"
+        self.db.executeAll(query, tuple(list))
+
+    def run(self):
+        try:
+            self.initMap()
+            minutes = datetime.timedelta(minutes=2)
+            lasttime = (datetime.datetime.now()-minutes).strftime("%Y%m%d%H%M00")
+
+            while self.isRunning:
+                try:
+                    nowtime = datetime.datetime.now()-minutes
+                    now = nowtime.strftime("%Y%m%d%H%M00")
+                    if lasttime == now:
+                        time.sleep(1)
+                        continue
+
+                    time.sleep(10)
+
+                    lasttime = now
+
+                    logging.debug("Delete CurrentData : %s"%(now))
+                    self.deleteCurrentTbl(now)
+
+                    # n min
+                    sec = int(time.time())-(60*2)+32400
+                    # info = period, tblname, cycle, reftbl
+                    for info in self.configList:
+                        period = info[0]
+                        tblname = info[1]
+                        cycle = info[2]
+                        reftbl = info[3]
+
+                        if period == 1:
+                            logging.debug("Delete HistoryData")
+                            self.deleteHistoryTbl("HISTORY", nowtime, cycle)
+                            continue
+
+                        if len(tblname)==0:
+                            continue
+
+                        if self.actionMap[tblname] != (sec/(period*60)):
+                            self.actionMap[tblname] = (sec/(period*60))
+                            logging.info("time = %s, period = %d, %s, %d, %s"%(now, period, tblname, cycle, reftbl))
+                            logging.info("Delete HistoryData : %s"%(tblname))
+                            self.deleteHistoryTbl(tblname, nowtime, cycle)
+                            logging.info("Insert HistoryData : %s"%(tblname))
+                            self.getHistoryData(tblname, reftbl, nowtime, period)
+
+                    logging.info("Done History Job")
+                except Exception:
+                    logging.exception("In HistoryJob")
+        except Exception:
+            logging.exception("HistoryJob")
+        
+    def stopJob(self):
+        self.isRunning = False
+
+
+class MainJob:
+    def __init__(self, property):
+        self.threads = []
+        self.property = property
+        self.restartmap = dict()
+        self.isRunning = True
+        self.andromeda = None
+        self.setupTicket = {}
+
+    def startThread(self, now):
+        jobSet = {}
+
+        for host, data in self.property.hostMap.items():
+            if data["RUNMODE"] == RUNMODE_NONE:
+                continue
+
+            server = data["SERVER"]
+            if server in jobSet:
+                continue
+
+            if host in self.setupTicket:
+                self.setupTicket[host] -= 1
+
+                if self.setupTicket[host] < 0:
+                    del self.setupTicket[host]
+                
+            monitor = GatheringHandler(self, host, now)
+            monitor.start()
+            jobSet[server] = data["RUNMODE"]
+
+            self.threads.append(monitor)
+
+            sleeptime = self.property.mainMap["GETHERING_THREAD_INTERVAL"]
+            
+            time.sleep(sleeptime)
+    
+    def stopThread(self):
+        while len(self.threads) > 0:
+            monitor = self.threads.pop(0)
+            monitor.close()
+
+        logging.info("Stop thread >> %s"%(str(self.threads)))
+
+    def stopJob(self):
+        self.isRunning = False
+        self.stopThread()
+
+    def getOpenFiles(self):
+        handle = os.popen("cat /proc/sys/fs/file-nr | awk '{print $1}'")
+        lines = handle.readlines()
+        handle.close()
+        openfile = "".join(lines).strip()
+
+        return int(openfile)
+
+    def runJob(self):
+        try:
+            lasttime = datetime.datetime.now().strftime("%Y%m%d%H%M00")
+            tic = 0
+            
+            if self.property.mainMap["SAVE_COLLECTED_DATA"].lower() == "yes":
+                savedir = "%s"%(self.property.mainMap["REMOTE_DATA_PATH"])
+                if not os.path.exists(savedir):
+                    os.makedirs(savedir)
+
+            if self.property.mainMap["USE_ANDROMEDA"] == "yes":
+                self.andromeda = Andromeda()
+                self.andromeda.setLogging(logging)
+
+            openfile1 = self.getOpenFiles()
+            logging.info("1th Open Files = %d"%(openfile1))
+
+            while self.isRunning:
+                try:
+                    nowtime = datetime.datetime.now()
+                    now = nowtime.strftime("%Y%m%d%H%M00")
+                    if lasttime == now:
+                        # timeout
+                        if tic == 40:
+                            self.stopThread()
+                        tic = tic + 1
+                        time.sleep(1)
+                        continue
+        
+                    tic = 0
+                    lasttime = now
+                    logging.info("Current Time = %s"%(now))
+        
+
+                    # test
+                    openfile2 = self.getOpenFiles()
+                    logging.info("Current Open Files = %d"%(openfile2))
+
+                    if (openfile2 - openfile1) > 10000:
+                        logging.error("Open Files - too many")
+                        sys.exit()
+
+                    # gathering data 1 minute ago
+                    minutes = datetime.timedelta(minutes=1)
+                    now = (nowtime-minutes).strftime("%Y%m%d%H%M00")
+
+                    self.property.buildMapData()
+
+                    if self.andromeda:
+                        self.andromeda.loadConfig()
+
+                    self.startThread(now)
+
+                except Exception:
+                    logging.exception("In while : runJob")
+
+        except Exception, e:
+            logging.exception("runJob")
+
+class Property:
+    def __init__(self):
+        self.mainMap = None
+        self.alertholdMap = None
+        self.alertMap = None
+        self.hostMap = None
+        self.agentMap = None
+        self.allHostsMap = None
+        # Mymon 용도 ==================================================================
+        self.duplicatedHostMap = None
+
+        self.itemMap = None
+
+        self.mainModifiedTime = None
+        self.alertholdModifiedTime = None
+        self.alertModifiedTime = None
+        self.serverdbModifiedTime = None
+        self.sysmondbModifiedTime = None
+
+    def loadProperty(self, file, lastmtime):
+        try:
+            if not os.path.exists(file):
+                raise Exception, "Dose not exist a file, %s."%(file)
+
+            modifiedtime = os.path.getmtime(file)
+            tm = time.strftime("%Y.%m.%d-%H:%M:%S",time.localtime(modifiedtime))
+
+            if lastmtime != modifiedtime:
+                logging.info("%s file was last modified : %s"%(file,tm))
+
+                lines = ""
+                f=open(file, 'r')
+                lines = f.readlines()
+                f.close()
+
+                map = {}
+                for line in lines:
+                    if line=="": continue
+                    if line.startswith("#"): continue
+
+                    #logging.debug("Property file - " + line.strip(" \r\n"))
+                    infos = line.split("=", 2)
+                    if len(infos)==2:
+                        key = infos[0].strip(' \n\r')
+                        value = infos[1].strip(' \n\r')
+                        map[key] = value
+
+                lastmtime = modifiedtime
+
+                return map
+            else:
+                logging.debug("%s file is not changed : %s"%(file, tm))
+
+        except Exception:
+            logging.exception("Cannot load properties : %s."%(file))
+
+        return None
+
+    def checkMainMap(self, map):
+        try:
+            if self.mainMap and self.mainMap == map:
+                return False
+
+            if 'PORT' in map and map["PORT"] <> "":
+                map["PORT"] = int(map["PORT"])
+            else:
+                raise Exception, "%s info is not exist."%("PORT")
+
+            if not 'COLLECTION_MODE' in map:
+                raise Exception, "%s info is not exist."%("COLLECTION_MODE")
+            else:
+                if not (map["COLLECTION_MODE"] == "TESTMODE" or map["COLLECTION_MODE"] == "REALMODE"):
+                    raise Exception, "%s is TESTMODE / REALMODE."%("COLLECTION_MODE")
+            
+            if 'USE_HOSTPING' in map and map["USE_HOSTPING"].lower() == "yes":
+                if 'ITEM_ID_HOSTPING' in map and map["ITEM_ID_HOSTPING"] <> "":
+                    map["ITEM_ID_HOSTPING"] = int(map["ITEM_ID_HOSTPING"])
+                else:
+                    raise Exception, "%s info is not exist."%("ITEM_ID_HOSTPING")
+            else:
+                map["USE_HOSTPING"] = "no"
+
+            if 'GETHERING_THREAD_INTERVAL' in map and map["GETHERING_THREAD_INTERVAL"] <> "":
+                map["GETHERING_THREAD_INTERVAL"] = float(map["GETHERING_THREAD_INTERVAL"])
+            else:
+                map["GETHERING_THREAD_INTERVAL"] = 0.005
+
+            if 'SAVE_COLLECTED_DATA' in map and map["SAVE_COLLECTED_DATA"].lower() == "yes":
+                if not ('REMOTE_DATA_PATH' in map and map["REMOTE_DATA_PATH"] <> ""):
+                    raise Exception, "%s info is not exist."%("REMOTE_DATA_PATH")
+            else:
+                map["SAVE_COLLECTED_DATA"] = "no"
+
+            if 'USE_ANDROMEDA' in map and map["USE_ANDROMEDA"].lower() == "yes":
+                map["USE_ANDROMEDA"] = "yes"
+            else:
+                map["USE_ANDROMEDA"] = "no"
+
+
+            if not 'SERVERDB_HOST' in map or not map["SERVERDB_HOST"]: raise Exception, "%s info is not exist."%("SERVERDB_HOST")
+            if not 'SERVERDB_PORT' in map or not map["SERVERDB_PORT"]: raise Exception, "%s info is not exist."%("SERVERDB_PORT")
+            if not 'SERVERDB_USER' in map or not map["SERVERDB_USER"]: raise Exception, "%s info is not exist."%("SERVERDB_USER")
+            if not 'SERVERDB_PASS' in map: raise Exception, "%s info is not exist."%("SERVERDB_PASS")
+            if not 'SERVERDB_NAME' in map or not map["SERVERDB_NAME"]: raise Exception, "%s info is not exist."%("SERVERDB_NAME")
+
+            if not 'SYSMONDB_HOST' in map or not map["SYSMONDB_HOST"]: raise Exception, "%s info is not exist."%("SYSMONDB_HOST")
+            if not 'SYSMONDB_PORT' in map or not map["SYSMONDB_PORT"]: raise Exception, "%s info is not exist."%("SYSMONDB_PORT")
+            if not 'SYSMONDB_USER' in map or not map["SYSMONDB_USER"]: raise Exception, "%s info is not exist."%("SYSMONDB_USER")
+            if not 'SYSMONDB_PASS' in map: raise Exception, "%s info is not exist."%("SYSMONDB_PASS")
+            if not 'SYSMONDB_NAME' in map or not map["SYSMONDB_NAME"]: raise Exception, "%s info is not exist."%("SYSMONDB_NAME")
+            if not 'SYSMONDB_MINPOOL' in map or not map["SYSMONDB_MINPOOL"]: map["SYSMONDB_MINPOOL"] = "10"
+            if not 'SYSMONDB_MAXPOOL' in map or not map["SYSMONDB_MAXPOOL"]: map["SYSMONDB_MAXPOOL"] = "50"
+
+            map["SERVERDB"] =  { 
+                                    "HOST" : map["SERVERDB_HOST"],
+                                    "PORT" : int(map["SERVERDB_PORT"]),
+                                    "USER" : map["SERVERDB_USER"],
+                                    "PASS" : map["SERVERDB_PASS"],
+                                    "NAME" : map["SERVERDB_NAME"]
+                                }
+                                                             
+            map["SYSMONDB"] =  { 
+                                    "HOST" : map["SYSMONDB_HOST"],
+                                    "PORT" : int(map["SYSMONDB_PORT"]),
+                                    "USER" : map["SYSMONDB_USER"],
+                                    "PASS" : map["SYSMONDB_PASS"],
+                                    "NAME" : map["SYSMONDB_NAME"],
+                                    "MIN" : int(map["SYSMONDB_MINPOOL"]),
+                                    "MAX" : int(map["SYSMONDB_MAXPOOL"])
+                                }
+
+        except Exception:
+            logging.exception("daemon.conf is wrong.")
+            return False
+
+        return True
+
+    def loadAlertMap(self):
+        try:
+            if not os.path.exists(ALERT_STATE_DIR):
+                os.mkdir(ALERT_STATE_DIR)
+
+            if not os.path.exists(ALERT_FILE):
+                raise Exception, "Dose not exist a file, %s."%(ALERT_FILE)
+
+            modifiedtime = os.path.getmtime(ALERT_FILE)
+            tm = time.strftime("%Y.%m.%d-%H:%M:%S",time.localtime(modifiedtime))
+
+            if self.alertModifiedTime != modifiedtime:
+                self.alertModifiedTime = modifiedtime
+
+                config = ConfigParser.ConfigParser()
+                config.read(ALERT_FILE)
+
+                self.alertMap = {}
+
+                for section in config.sections():
+                    statedir = "%s/%s"%(ALERT_STATE_DIR, section)
+                    if not os.path.exists(statedir):
+                        os.mkdir(statedir)
+
+                    self.alertMap[section] = dict()
+                    for option in config.options(section):
+                        if option == 'errortimes':
+                            value = int(config.get(section,option))
+                        else:
+                            value = config.get(section,option)
+
+                        self.alertMap[section][option] = value
+
+                    servers = self.getServers(self.alertMap[section]['servers'])
+                    self.alertMap[section]['servers'] = self.getServerMap(servers)
+                    self.alertMap[section]['mobile'] = self.alertMap[section]['mobile'].split()
+            else:
+                logging.debug("%s file is not changed : %s"%(ALERT_FILE, tm))
+
+        except Exception, e:
+            logging.exception("Cannot load alert configure.")
+            return False
+
+        return True
+
+    def loadAlertHold(self):
+        try:
+            if not os.path.exists(ALERT_HOLD_FILE):
+                raise Exception, "Dose not exist a file, %s."%(ALERT_HOLD_FILE)
+
+            modifiedtime = os.path.getmtime(ALERT_HOLD_FILE)
+            tm = time.strftime("%Y.%m.%d-%H:%M:%S",time.localtime(modifiedtime))
+
+            if self.alertholdModifiedTime != modifiedtime:
+                self.alertholdModifiedTime = modifiedtime
+
+                lines = ""
+                f=open(ALERT_HOLD_FILE, 'r')
+                lines = ' '.join(f.readlines())
+                f.close()
+                
+                self.alertholdMap = self.getServers(lines)
+
+            else:
+                logging.debug("%s file is not changed : %s"%(ALERT_HOLD_FILE, tm))
+
+        except Exception, e:
+            logging.exception("Cannot load alert-hold configure.")
+            return False
+
+        return True
+
+    def loadItemMap(self):
+        db = None
+        map = { "ID" : {}, "NAME" : {} } 
+
+        try:
+            records = None
+            db = DB(self.mainMap["SYSMONDB"])
+            
+            query = "SELECT DID, NAME, TYPE, UNIT, VALUE FROM DATA_INFO"
+    
+            records = db.select(query)
+            
+            if records:
+                for record in records:
+                    did = int(record['DID'])
+                    name = record['NAME']
+                    type = record['TYPE']
+                    unit = record['UNIT']
+                    default = record['VALUE']
+        
+                    if default:
+                        if type == "int":
+                            default = int(default)
+                        elif type == "float":
+                            default = float(default)
+
+                    map["ID"][did] = [did, name, type, unit, default] 
+                    map["NAME"][name] = [did, name, type, unit, default]
+            else:
+                map = {}
+
+        except Exception:
+            map = {}
+            logging.exception("Cannot load item map.")
+
+        return map
+     
+    # Mymon 용도 ==================================================================
+    def makeDuplicatedHostMap(self):
+        if 'ALLOW_DUPLICATED_HOSTNAME' in self.mainMap and self.mainMap["ALLOW_DUPLICATED_HOSTNAME"] == "yes":
+            self.duplicatedHostMap = {}
+
+            for host, data in self.hostMap.items():
+                server = data["SERVER"]
+
+                if server in self.duplicatedHostMap:
+                    self.duplicatedHostMap[server].append(host)
+                else:
+                    self.duplicatedHostMap[server] = [host]
+
+    def loadHostMap(self):
+
+        allHostsMap = {}
+        hostMap = {}
+        agentMap = {}
+
+        try:
+            records = None
+
+            query = "SELECT HOST, DOMAIN, IP, OS, VERSION, COUNTRY, SERVICE, FUNCTION, LIFE, OPT1, OPT2, OPT3"
+            query = "%s FROM SYSMON_VIEW"%(query)
+            query = "%s WHERE PROGRAM='sysmon'"%(query)
+
+            records = DB.selectDirectly(self.mainMap["SERVERDB"], query)
+
+            if records:
+                for record in records:
+                    host = str(record['HOST'])
+                    domain = str(record['DOMAIN'])
+                    ip = str(record['IP'])
+                    os = str(record['OS']).lower()
+                    version = str(record['VERSION']).lower()
+                    country = str(record['COUNTRY']).lower()
+                    service = str(record['SERVICE'])
+                    function = str(record['FUNCTION'])
+                    runmode = int(record['LIFE'])
+                    dbagent = str(record['OPT2'])
+
+                    allHostsMap[host] = {
+                                    "COUNTRY" : country,
+                                    "SERVICE" : service,
+                                    "FUNCTION" : function,
+                                    "RUNMODE" : runmode,
+                                }
+
+                    if runmode > 0:
+                        server = host
+                        if ip:
+                            server = ip.split('|')[0]
+                        else:
+                            if domain:
+                                server = "%s.%s"%(host, domain)
+
+                        hostMap[host] = {
+                                        "SERVER" : server,
+                                        "DOMAIN" : domain,
+                                        "IP" : ip,
+                                        "OS" : os,
+                                        "VERSION" : version,
+                                        "COUNTRY" : country,
+                                        "SERVICE" : service,
+                                        "FUNCTION" : function,
+                                        "RUNMODE" : runmode,
+                                        "DBAGENT" : dbagent
+                                    }
+                    
+                    if dbagent:
+                        if dbagent in agentMap:
+                            agentMap[dbagent].append(host)
+                        else:
+                            agentMap[dbagent] = [host]
+
+        except:
+            allHostsMap = {}
+            hostMap = {}
+            agentMap = {}
+            logging.exception("Cannot make ServerDBMap.")
+
+        return allHostsMap, hostMap, agentMap
+
+    def loadSysmonDB(self):
+        if not os.path.exists(SYSMONDB_FILE):
+            raise Exception, "Dose not exist a file, %s."%(SYSMONDB_FILE)
+
+        modifiedtime = os.path.getmtime(SYSMONDB_FILE)
+        tm = time.strftime("%Y.%m.%d-%H:%M:%S",time.localtime(modifiedtime))
+
+        if self.sysmondbModifiedTime != modifiedtime:
+            self.sysmondbModifiedTime = modifiedtime
+
+            map = self.loadItemMap()
+            if map:
+                self.itemMap = map
+            else:
+                return False
+
+            #pprint(self.itemMap)
+
+        return True
+
+
+    def loadServerDB(self):
+        if not os.path.exists(SERVERDB_FILE):
+            raise Exception, "Dose not exist a file, %s."%(SERVERDB_FILE)
+
+        modifiedtime = os.path.getmtime(SERVERDB_FILE)
+        tm = time.strftime("%Y.%m.%d-%H:%M:%S",time.localtime(modifiedtime))
+
+        try:
+            if self.serverdbModifiedTime != modifiedtime:
+                self.serverdbModifiedTime = modifiedtime
+
+                allHostsMap, hostMap, agentMap = self.loadHostMap()
+                if allHostsMap:
+                    self.allHostsMap = allHostsMap
+                    self.hostMap = hostMap
+                    self.agentMap = agentMap
+
+                    # Mymon 용도 ==================================================================
+                    self.makeDuplicatedHostMap()
+                else:
+                    return False
+
+                #pprint(self.hostMap)
+                #pprint(self.agentMap)
+        except Exception, e:
+            logging.exception("Cannot make server map.");
+
+        return True
+
+    def checkDualMode(self):
+        modeAgent = False
+        modeDBAgent = False
+
+        for host, data in self.hostMap.items():
+            if modeAgent and modeDBAgent:
+                break
+
+            if not modeAgent:
+                if self.hostMap[host]["RUNMODE"] == RUNMODE_AGENT:
+                    modeAgent = True
+                    
+            if not modeDBAgent:
+                if self.hostMap[host]["RUNMODE"] == RUNMODE_DBAGENT:
+                    modeDBAgent = True
+
+        self.mainMap["IS_DUALMODE"] = modeAgent and modeDBAgent
+        #print "IS_DUALMODE = ", self.mainMap["IS_DUALMODE"]
+
+    def buildMapData(self):
+        """
+        환경 정보를 가져와 변경되었다면 Update함
+
+        File에서 읽어오는 설정 값들
+            MAIN_FILE       = './conf/daemon.conf'
+            LOG_FILE        = './conf/log.daemon.conf'
+            ALERT_FILE      = './conf/alert.conf'
+            ALERT_HOLD_FILE = './conf/alerthold.conf'
+            SERVERDB_FILE   = './output/reload/serverdb'
+
+        DB에서 가져오는 설정값들
+            기계DB
+            수집 ITEM 정보
+
+        """
+        map = self.loadProperty(MAIN_FILE, self.mainModifiedTime)
+        if map and self.checkMainMap(map):
+            self.mainMap = map
+        else:
+            return False
+
+        #pprint(self.mainMap)
+
+        if not self.loadServerDB():
+            return False
+
+        if not self.loadSysmonDB():
+            return False
+
+        if not self.loadAlertMap():
+            return False
+
+        #pprint (self.alertMap)
+
+        if not self.loadAlertHold():
+            return False
+
+        #pprint (self.alertholdMap)
+        self.checkDualMode()
+
+        return True
+
+    def getServerMap(self, servers):
+        servermap = {}
+
+        for server in servers:
+            servermap[server] = 0
+
+        return servermap
+
+    def getServers(self, rawdata, unique = True):
+        rawdatalist = rawdata.split()
+        servers = []
+
+        for item in rawdatalist:
+            if item[0] == '*':
+                servers = self.hostMap.keys()
+                break
+
+            if item.find('~') > 0:
+                serverpair = item.split('~')
+                prefix1,postfix1,start,length1 = self.parseHostname(serverpair[0])
+                prefix2,postfix2,end,length2 = self.parseHostname(serverpair[1])
+
+                if len(serverpair)!=2:
+                    raise Exception, "Hostname data is wrong. ex) server001~server010 => %s"%(item)
+                if prefix1!=prefix2 or postfix1!=postfix2 or length1!=length2:
+                    raise Exception, "Hostname data is wrong. ex) server001~server010 => %s"%(item)
+
+                for index in range(start,end+1):
+                    server = prefix1 + ("%0"+str(length1)+"d")%index + postfix1
+                    servers.append(server)
+            else:
+                server = item
+                servers.append(server)
+
+        if unique:
+            servers = list(Set(servers))
+
+        return servers
+
+    def parseHostname(self, hostname):
+        list=hostname.split('.')
+        prefix=list[0]
+        if len(list)>1:
+            postfix='.'+'.'.join(list[1:])
+        else:
+            postfix=''
+        for index in range(len(prefix)):
+            if prefix[index:].isdigit(): break
+        return prefix[:index], postfix, int(prefix[index:]), len(prefix[index:])
+
+
+
+def exit_program(signum, f):
+    global history
+    global job
+
+    if history: history.stopJob()
+    else: logging.info("History Data Job is not running.")
+
+    if job: job.stopJob()
+    else: logging.info("Main Daemon Job is not running.")
+
+def check_program():
+    try:
+        command = "pgrep -l -f 'python.*SysmonDaemon'"
+        handle = os.popen(command)
+        lines = handle.readlines()
+        handle.close()
+        return len(lines)>1
+        
+    except Exception, e:
+        logging.exception("Cannot check a duplicated program.")
+        return True
+
+def initLogger():
+    logging.config.fileConfig(LOG_FILE)
+    logging.getLogger("root")
+
+    #logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)-5s %(threadName)s - %(message)s')
+
+
+if __name__=="__main__":
+    initLogger()
+
+    if check_program():
+        sys.exit()
+
+    # signal process
+    signal.signal(signal.SIGINT, exit_program)
+    signal.signal(signal.SIGQUIT, exit_program)
+
+    property = Property()
+    if not property.buildMapData():
+        sys.exit()
+
+    history = HistoryJob(property)
+    history.start()
+
+    job = MainJob(property)
+    job.runJob()
