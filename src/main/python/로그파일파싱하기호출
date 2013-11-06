@@ -1,0 +1,7 @@
+# 호출
+dist -c "grep '2013-11-06 14:22:22' /pang/logs/trace_order/trace_order2.log" web01 | ~/user/pilgrim21c/log2db.py mobile
+
+#로그샘플
+[web01]   [OUT] INFO  2013-11-06 14:29:51 [TP-Processor507] c.c.f.c.order.OrderTraceLogger - [ORDER_LOGGER] type:ORDER_RESULT_GENERAL memberSrl:3887936 checkoutId:1383715655520 orderId:115739916 payType:CARD acquirerType:BC browser:MSIE7(32bit) referer:https://pay.coupang.com/xPayRequest.pang?orderId=115739916&checkoutId=1383715655520&hubMode=true
+[web01]   [OUT] INFO  2013-11-06 14:29:53 [TP-Processor536] c.c.f.c.order.OrderTraceLogger - [ORDER_LOGGER] type:ORDER_PRE_ORDER memberSrl:32485623 checkoutId:1383715747793 orderId:115739987 payType:VIRTUALACCOUNT acquirerType: browser:MSIE8(32bit) referer:https://pay.coupang.com/orderForm.pang?checkoutId=1383715747793
+

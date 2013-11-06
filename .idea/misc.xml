@@ -6,8 +6,10 @@
     <option name="formatter" value="ECLIPSE" />
     <option name="id" value="1374562920785" />
     <option name="name" value="default" />
-    <option name="pathToConfigFileJS" value="C:/formatter/configuration_eclipse_formatter_Coupang Formatter for JavaScript.htm" />
-    <option name="pathToConfigFileJava" value="C:/formatter/configuration_eclipse_formatter_Coupang Formatter for Java.htm" />
+    <option name="pathToConfigFileJS" value="C:/formatter/configuration_eclipse_formatter_Coupang Formatter for JavaScript.xml" />
+    <option name="pathToConfigFileJava" value="C:/formatter/configuration_eclipse_formatter_Coupang Formatter for Java.xml" />
+    <option name="selectedJavaProfile" value="Coupang Standard For JAVA(v1.0)" />
+    <option name="selectedJavaScriptProfile" value="Coupang Standard For JavaScript(v1.0)" />
   </component>
   <component name="EntryPointsManager">
     <entry_points version="2.0" />

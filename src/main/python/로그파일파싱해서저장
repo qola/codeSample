@@ -1,0 +1,41 @@
+#!/pang/program/python/bin/python
+#coding: utf-8
+import time
+import subprocess
+import sys
+import json
+import _mysql
+import re
+from datetime import date, timedelta
+
+def writelog():
+    device = ""
+    if len(sys.argv) >  0:
+        device = sys.argv[1]
+
+	db = _mysql.connect(host="xxxx", port=3306, passwd="xxxx", db="xxxx", user="xxxx")
+	cursor = db.cursor()
+
+    for line in sys.stdin:
+        print line
+
+        if re.search('ORDER_LOGGER',line):
+            logDate = re.search(r'INFO\s\s(.*?)\s\[',line).group(1).replace('-','').replace(' ','').replace(':','')
+            logType = re.search(r'type:(.*?)\s',line).group(1)
+			memberSrl = re.search(r'memberSrl:(.*?)\s',line).group(1)
+			checkoutId = re.search(r'checkoutId:(.*?)\s',line).group(1)
+			orderId = re.search(r'orderId:(.*?)\s',line).group(1)
+			payType = re.search(r'payType:(.*?)\s',line).group(1)
+			acquirerType = re.search(r'acquirerType:(.*?)\s',line).group(1)
+			browser = re.search(r'browser:(.*?)\s',line).group(1)
+
+			query = """ INSERT IGNORE INTO TABLE ()
+				values('{0}','{1}')""".format(logDate, ...)
+
+			cursor.execute(query)
+
+    db.commit()
+	db.close()
+
+if __name__ == '__main__':
+    writelog()
