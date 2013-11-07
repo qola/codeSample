@@ -1,41 +1,69 @@
 #!/pang/program/python/bin/python
 #coding: utf-8
 import time
-import subprocess
 import sys
-import json
-import _mysql
+import MySQLdb
 import re
 from datetime import date, timedelta
 
 def writelog():
+    today = date.today()
+    tomorrow = date.today() + timedelta(1)
+    beforAweek = date.today() - timedelta(7)
+
+    db = MySQLdb.connect(host="xxx", port=3306, passwd="xxxx", db="xxx", user="xxxx")
+    cursor = db.cursor()
+
+    #delete dumy partition & create new partition
+    try:
+        partitionDropQuery ="ALTER TABLE order_trace_log DROP PARTITION p"+str(beforAweek).replace("-","")
+        #print partitionDropQuery
+        cursor.execute(partitionDropQuery)
+    except Exception:
+        print "already droped"
+    try:
+        partitionAddQuery = "ALTER TABLE order_trace_log  ADD PARTITION (PARTITION p"+str(today).replace("-","")+" VALUES LESS THAN ("+str(tomorrow).replace("-","")+"000000))"
+        #print partitionAddQuery
+        cursor.execute(partitionAddQuery)
+    except Exception:
+        print "already exist"
+
+
+    # order log insert
     device = ""
     if len(sys.argv) >  0:
         device = sys.argv[1]
 
-	db = _mysql.connect(host="xxxx", port=3306, passwd="xxxx", db="xxxx", user="xxxx")
-	cursor = db.cursor()
+    query = """INSERT IGNORE INTO order_trace_log
+        ( created, checkoutId, memberSrl, device, logType, payType, acquirerType)
+        values(%s, %s, %s, %s, %s, %s,%s)"""
 
+    cnt = 0
+    list =[]
     for line in sys.stdin:
-        print line
+        #print line
 
         if re.search('ORDER_LOGGER',line):
             logDate = re.search(r'INFO\s\s(.*?)\s\[',line).group(1).replace('-','').replace(' ','').replace(':','')
             logType = re.search(r'type:(.*?)\s',line).group(1)
-			memberSrl = re.search(r'memberSrl:(.*?)\s',line).group(1)
-			checkoutId = re.search(r'checkoutId:(.*?)\s',line).group(1)
-			orderId = re.search(r'orderId:(.*?)\s',line).group(1)
-			payType = re.search(r'payType:(.*?)\s',line).group(1)
-			acquirerType = re.search(r'acquirerType:(.*?)\s',line).group(1)
-			browser = re.search(r'browser:(.*?)\s',line).group(1)
+            memberSrl = re.search(r'memberSrl:(.*?)\s',line).group(1)
+            checkoutId = re.search(r'checkoutId:(.*?)\s',line).group(1)
+            orderId = re.search(r'orderId:(.*?)\s',line).group(1)
+            payType = re.search(r'payType:(.*?)\s',line).group(1)
+            acquirerType = re.search(r'acquirerType:(.*?)\s',line).group(1)
+            browser = re.search(r'browser:(.*?)\s',line).group(1)
 
-			query = """ INSERT IGNORE INTO TABLE ()
-				values('{0}','{1}')""".format(logDate, ...)
+            cnt += 1
+            list.append((logDate, checkoutId, memberSrl, device, logType, payType, acquirerType))
 
-			cursor.execute(query)
-
+    cursor.executemany( query, tuple(list) )
     db.commit()
-	db.close()
+
+    if cursor!=None: cursor.close()
+    if db!=None: db.close()
+
+    print str(cnt)+"row insert"
+
 
 if __name__ == '__main__':
     writelog()

@@ -5,3 +5,26 @@ dist -c "grep '2013-11-06 14:22:22' /pang/logs/trace_order/trace_order2.log" web
 [web01]   [OUT] INFO  2013-11-06 14:29:51 [TP-Processor507] c.c.f.c.order.OrderTraceLogger - [ORDER_LOGGER] type:ORDER_RESULT_GENERAL memberSrl:3887936 checkoutId:1383715655520 orderId:115739916 payType:CARD acquirerType:BC browser:MSIE7(32bit) referer:https://pay.coupang.com/xPayRequest.pang?orderId=115739916&checkoutId=1383715655520&hubMode=true
 [web01]   [OUT] INFO  2013-11-06 14:29:53 [TP-Processor536] c.c.f.c.order.OrderTraceLogger - [ORDER_LOGGER] type:ORDER_PRE_ORDER memberSrl:32485623 checkoutId:1383715747793 orderId:115739987 payType:VIRTUALACCOUNT acquirerType: browser:MSIE8(32bit) referer:https://pay.coupang.com/orderForm.pang?checkoutId=1383715747793
 
+
+
+CREATE TABLE `order_trace_log` (
+  `created` BIGINT(20) UNSIGNED NOT NULL COMMENT '생성일 yyyyMMddHHmmss',
+  `checkoutId` BIGINT(20) UNSIGNED NOT NULL,
+  `memberSrl` BIGINT(20) UNSIGNED NOT NULL,
+  `device` VARCHAR(10) NOT NULL COMMENT 'PC,MOBILE',
+  `logType` VARCHAR(30) NOT NULL COMMENT 'preOrder, orderResult',
+  `payType` VARCHAR(30) NOT NULL COMMENT '결제타입- card, bank..',
+  `acquirerType` VARCHAR(30) DEFAULT NULL COMMENT '매입사기준 카드타입',
+  PRIMARY KEY (`created`,`checkoutId`,`logType`)
+)
+PARTITION BY RANGE (created)
+(
+PARTITION p20131030 VALUES LESS THAN (20131031000000),
+PARTITION p20131031 VALUES LESS THAN (20131101000000),
+PARTITION p20131101 VALUES LESS THAN (20131102000000),
+PARTITION p20131102 VALUES LESS THAN (20131103000000),
+PARTITION p20131103 VALUES LESS THAN (20131104000000),
+PARTITION p20131104 VALUES LESS THAN (20131105000000),
+PARTITION p20131105 VALUES LESS THAN (20131106000000),
+PARTITION p20131106 VALUES LESS THAN (20131107000000)
+)
